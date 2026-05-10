@@ -658,8 +658,6 @@ void usb_handler_thread::operator()()
 		// Process asynchronous requests that are pending
 		libusb_handle_events_timeout_completed(ctx, &lusb_tv, nullptr);
 
-		u64 delay = 1'000;
-
 		// Process fake transfers
 		if (!fake_transfers.empty())
 		{
@@ -674,13 +672,6 @@ void usb_handler_thread::operator()()
 
 				if (transfer->expected_time > timestamp)
 				{
-					const u64 diff_time = transfer->expected_time - timestamp;
-
-					if (diff_time < delay)
-					{
-						delay = diff_time;
-					}
-
 					++it;
 					continue;
 				}
@@ -699,7 +690,7 @@ void usb_handler_thread::operator()()
 		if (handled_devices.empty())
 			thread_ctrl::wait_for(500'000);
 		else
-			thread_ctrl::wait_for(delay);
+			std::this_thread::yield();
 	}
 }
 

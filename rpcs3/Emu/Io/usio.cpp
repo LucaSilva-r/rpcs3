@@ -18,7 +18,15 @@
 #include "Emu/Io/usio_config.h"
 #include "Emu/IdManager.h"
 
+#include "Emu/Cell/timers.hpp"
+#include <queue>
+#include <deque>
+#include <mutex>
+
 LOG_CHANNEL(usio_log, "USIO");
+
+std::deque<int> g_taiko_queue[2][4];
+std::mutex g_taiko_mutex;
 
 namespace
 {
@@ -347,77 +355,188 @@ void usb_device_usio::translate_input_taiko()
 	const auto handler = pad::get_pad_thread();
 
 	std::vector<u8> input_buf(0x60);
-	constexpr le_t<u16> c_hit = 0x1800;
 	le_t<u16> digital_input = 0;
 
-	const auto translate_from_pad = [&](usz pad_number, usz player)
+	static bool valueStates[2][4] = {};
+
+	// Tracks held state so holding a key does not spam hits
+	static bool lastPressed[2][4] = {};
+
+	const auto fire_hit = [&](u8* ptr, usz player, int lane)
 	{
+		if (!ptr)
+			return;
+
+		bool& state = valueStates[player][lane];
+
+		u16 hit_val = state ? 51 : 50;
+		state = !state;
+
+		u16 analog_val = (hit_val << 15) / 100 + 1;
+
+		le_t<u16> out = analog_val;
+
+		std::memcpy(ptr, &out, sizeof(u16));
+	};
+
+	// Queue ONE hit only on press transition
+	const auto push_hit_if_new = [&](usz player, int lane, bool pressed)
+	{
+		if (player >= 2 || lane < 0 || lane >= 4)
+			return;
+
+		bool& wasPressed = lastPressed[player][lane];
+
+		// Rising edge only
+		if (pressed && !wasPressed)
+		{
+			std::lock_guard<std::mutex> qlock(g_taiko_mutex);
+
+			if (g_taiko_queue[player][lane].size() < 32)
+			{
+				g_taiko_queue[player][lane].push_back(1);
+			}
+		}
+
+		wasPressed = pressed;
+	};
+
+	const auto translate_from_pad = [&](usz pad_num, usz player)
+	{
+		if (player >= 2 || pad_num >= g_cfg_usio.players.size())
+			return;
+
 		const usz offset = player * 8ULL;
 		auto& status = m_io_status[0];
 
-		if (const auto& pad = ::at32(handler->GetPads(), pad_number); pad->is_connected() && !pad->is_copilot() && is_input_allowed())
+		if (const auto& pad = ::at32(handler->GetPads(), pad_num);
+			(pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && is_input_allowed())
 		{
-			const auto& cfg = ::at32(g_cfg_usio.players, pad_number);
-			cfg->handle_input(pad, false, [&](usio_btn btn, pad_button /*pad_btn*/, u16 /*value*/, bool pressed, bool& /*abort*/)
-			{
-				switch (btn)
+			const auto& cfg = ::at32(g_cfg_usio.players, pad_num);
+
+			cfg->handle_input(pad, false,
+				[&](usio_btn btn, pad_button, u16, bool pressed, bool&)
 				{
-				case usio_btn::test:
-					if (player != 0) break;
-					if (pressed && !status.test_key_pressed) // Solve the need to hold the Test key
-						status.test_on = !status.test_on;
-					status.test_key_pressed = pressed;
-					break;
-				case usio_btn::coin:
-					if (player != 0) break;
-					if (pressed && !status.coin_key_pressed) // Ensure only one coin is inserted each time the Coin key is pressed
-						status.coin_counter++;
-					status.coin_key_pressed = pressed;
-					break;
-				case usio_btn::service:
-					if (player == 0 && pressed)
-						digital_input |= 0x4000;
-					break;
-				case usio_btn::enter:
-					if (player == 0 && pressed)
-						digital_input |= 0x200;
-					break;
-				case usio_btn::up:
-					if (player == 0 && pressed)
-						digital_input |= 0x2000;
-					break;
-				case usio_btn::down:
-					if (player == 0 && pressed)
-						digital_input |= 0x1000;
-					break;
-				case usio_btn::taiko_hit_side_left:
-					if (pressed)
-						std::memcpy(input_buf.data() + 32 + offset, &c_hit, sizeof(u16));
-					break;
-				case usio_btn::taiko_hit_center_right:
-					if (pressed)
-						std::memcpy(input_buf.data() + 36 + offset, &c_hit, sizeof(u16));
-					break;
-				case usio_btn::taiko_hit_side_right:
-					if (pressed)
-						std::memcpy(input_buf.data() + 38 + offset, &c_hit, sizeof(u16));
-					break;
-				case usio_btn::taiko_hit_center_left:
-					if (pressed)
-						std::memcpy(input_buf.data() + 34 + offset, &c_hit, sizeof(u16));
-					break;
-				default:
-					break;
-				}
-			});
+					switch (btn)
+					{
+					case usio_btn::test:
+					{
+						if (player == 0)
+						{
+							if (pressed && !status.test_key_pressed)
+								status.test_on = !status.test_on;
+
+							status.test_key_pressed = pressed;
+						}
+						break;
+					}
+
+					case usio_btn::coin:
+					{
+						if (player == 0)
+						{
+							if (pressed && !status.coin_key_pressed)
+								status.coin_counter++;
+
+							status.coin_key_pressed = pressed;
+						}
+						break;
+					}
+
+					case usio_btn::service:
+					{
+						if (player == 0 && pressed)
+							digital_input |= 0x4000;
+						break;
+					}
+
+					case usio_btn::enter:
+					{
+						if (player == 0 && pressed)
+							digital_input |= 0x200;
+						break;
+					}
+
+					case usio_btn::up:
+					{
+						if (player == 0 && pressed)
+							digital_input |= 0x2000;
+						break;
+					}
+
+					case usio_btn::down:
+					{
+						if (player == 0 && pressed)
+							digital_input |= 0x1000;
+						break;
+					}
+
+					case usio_btn::taiko_hit_side_left:
+					{
+						push_hit_if_new(player, 0, pressed);
+						break;
+					}
+
+					case usio_btn::taiko_hit_center_left:
+					{
+						push_hit_if_new(player, 1, pressed);
+						break;
+					}
+
+					case usio_btn::taiko_hit_center_right:
+					{
+						push_hit_if_new(player, 2, pressed);
+						break;
+					}
+
+					case usio_btn::taiko_hit_side_right:
+					{
+						push_hit_if_new(player, 3, pressed);
+						break;
+					}
+
+					default:
+						break;
+					}
+				});
+		}
+		else
+		{
+			std::lock_guard<std::mutex> qlock(g_taiko_mutex);
+
+			for (int i = 0; i < 4; ++i)
+			{
+				valueStates[player][i] = false;
+				lastPressed[player][i] = false;
+				g_taiko_queue[player][i].clear();
+			}
 		}
 
 		if (player == 0 && status.test_on)
 			digital_input |= 0x80;
+
+		// Consume one queued hit per frame
+		for (int i = 0; i < 4; ++i)
+		{
+			std::lock_guard<std::mutex> qlock(g_taiko_mutex);
+
+			if (!g_taiko_queue[player][i].empty())
+			{
+				g_taiko_queue[player][i].pop_front();
+
+				fire_hit(
+					input_buf.data() + 32 + offset + i * 2,
+					player,
+					i
+				);
+			}
+		}
 	};
 
 	for (usz i = 0; i < g_cfg_usio.players.size(); i++)
+	{
 		translate_from_pad(i, i);
+	}
 
 	std::memcpy(input_buf.data(), &digital_input, sizeof(u16));
 	std::memcpy(input_buf.data() + 16, &m_io_status[0].coin_counter, sizeof(u16));
