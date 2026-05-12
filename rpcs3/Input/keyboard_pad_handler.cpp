@@ -9,6 +9,10 @@
 #include <algorithm>
 #include <QApplication>
 
+// usio.cpp で作った箱を使わせてもらう宣言
+extern std::deque<int> g_taiko_queue[2][4];
+extern std::mutex g_taiko_mutex;
+
 bool keyboard_pad_handler::Init()
 {
 	const steady_clock::time_point now = steady_clock::now();
@@ -1177,7 +1181,7 @@ bool keyboard_pad_handler::bindPadToDevice(std::shared_ptr<Pad> pad)
 void keyboard_pad_handler::process()
 {
 	constexpr double stick_interval = 10.0;
-	constexpr double button_interval = 10.0;
+	constexpr double button_interval = 0.1;
 
 	const auto now = steady_clock::now();
 
@@ -1197,47 +1201,6 @@ void keyboard_pad_handler::process()
 		m_button_time = now;
 	}
 
-	if (m_mouse_move_used && m_mouse_movement_mode == mouse_movement_mode::relative)
-	{
-		constexpr double mouse_interval = 30.0;
-
-		const double elapsed_left  = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_mouse_move_left).count() / 1000.0;
-		const double elapsed_right = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_mouse_move_right).count() / 1000.0;
-		const double elapsed_up    = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_mouse_move_up).count() / 1000.0;
-		const double elapsed_down  = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_mouse_move_down).count() / 1000.0;
-
-		// roughly 1-2 frames to process the next mouse move
-		if (elapsed_left > mouse_interval)
-		{
-			Key(mouse::move_left, false);
-			m_last_mouse_move_left = now;
-		}
-		if (elapsed_right > mouse_interval)
-		{
-			Key(mouse::move_right, false);
-			m_last_mouse_move_right = now;
-		}
-		if (elapsed_up > mouse_interval)
-		{
-			Key(mouse::move_up, false);
-			m_last_mouse_move_up = now;
-		}
-		if (elapsed_down > mouse_interval)
-		{
-			Key(mouse::move_down, false);
-			m_last_mouse_move_down = now;
-		}
-	}
-
-	const auto get_lerped = [](f32 v0, f32 v1, f32 lerp_factor)
-	{
-		// linear interpolation from the current value v0 to the desired value v1
-		const f32 res = std::lerp(v0, v1, lerp_factor);
-
-		// round to the correct direction to prevent sticky values on small factors
-		return (v0 <= v1) ? std::ceil(res) : std::floor(res);
-	};
-
 	for (uint i = 0; i < m_pads_internal.size(); i++)
 	{
 		auto& pad = m_pads_internal[i];
@@ -1250,122 +1213,80 @@ void keyboard_pad_handler::process()
 			last_connection_status[i] = true;
 			connected_devices++;
 		}
-		else
-		{
-			if (update_sticks)
-			{
-				for (usz j = 0; j < pad.m_sticks.size(); j++)
-				{
-					const f32 stick_lerp_factor = (j < 2) ? m_l_stick_lerp_factor : m_r_stick_lerp_factor;
-
-					// we already applied the following values on keypress if we used factor 1
-					if (stick_lerp_factor < 1.0f)
-					{
-						const f32 v0 = static_cast<f32>(pad.m_sticks[j].m_value);
-						const f32 v1 = static_cast<f32>(m_stick_val[j]);
-						const f32 res = get_lerped(v0, v1, stick_lerp_factor);
-
-						pad.m_sticks[j].m_value = static_cast<u16>(res);
-					}
-				}
-			}
-
-			if (update_buttons)
-			{
-				for (Button& button : pad.m_buttons)
-				{
-					if (button.m_analog)
-					{
-						// we already applied the following values on keypress if we used factor 1
-						if (m_analog_lerp_factor < 1.0f)
-						{
-							const f32 v0 = static_cast<f32>(button.m_value);
-							const f32 v1 = static_cast<f32>(button.m_actual_value);
-							const f32 res = get_lerped(v0, v1, m_analog_lerp_factor);
-
-							button.m_value = static_cast<u16>(res);
-							button.m_pressed = button.m_value > 0;
-						}
-					}
-					else if (button.m_trigger)
-					{
-						// we already applied the following values on keypress if we used factor 1
-						if (m_trigger_lerp_factor < 1.0f)
-						{
-							const f32 v0 = static_cast<f32>(button.m_value);
-							const f32 v1 = static_cast<f32>(button.m_actual_value);
-							const f32 res = get_lerped(v0, v1, m_trigger_lerp_factor);
-
-							button.m_value = static_cast<u16>(res);
-							button.m_pressed = button.m_value > 0;
-						}
-					}
-				}
-			}
-		}
 	}
 
-	if (m_mouse_wheel_used)
+
+	static std::vector<std::vector<bool>> last_pressed_states;
+	if (last_pressed_states.size() < m_bindings.size())
 	{
-		// Releases the wheel buttons 0,1 sec after they've been triggered
-		// Next activation is set to distant future to avoid activating this on every proc
-		const auto update_threshold = now - std::chrono::milliseconds(100);
-		const auto distant_future = now + std::chrono::hours(24);
-
-		if (update_threshold >= m_last_wheel_move_up)
-		{
-			Key(mouse::wheel_up, false);
-			m_last_wheel_move_up = distant_future;
-		}
-		if (update_threshold >= m_last_wheel_move_down)
-		{
-			Key(mouse::wheel_down, false);
-			m_last_wheel_move_down = distant_future;
-		}
-		if (update_threshold >= m_last_wheel_move_left)
-		{
-			Key(mouse::wheel_left, false);
-			m_last_wheel_move_left = distant_future;
-		}
-		if (update_threshold >= m_last_wheel_move_right)
-		{
-			Key(mouse::wheel_right, false);
-			m_last_wheel_move_right = distant_future;
-		}
+		last_pressed_states.resize(m_bindings.size());
 	}
-
 	for (uint i = 0; i < m_bindings.size(); i++)
 	{
 		auto& pad = m_bindings[i].pad;
 		ensure(pad);
-
 		const cfg_pad* cfg = &m_pad_configs[pad->m_player_id];
 		ensure(cfg);
-
 		const Pad& pad_internal = m_pads_internal[i];
 
-		// Normalize and apply pad squircling
-		// Copy sticks first. We don't want to modify the raw internal values
+		// --- 1. あなたの「太鼓ヒット判定」ロジック (追加) ---
+		if (last_pressed_states[i].size() < pad_internal.m_buttons.size())
+		{
+			last_pressed_states[i].resize(pad_internal.m_buttons.size(), false);
+		}
+
+		for (size_t b = 0; b < pad_internal.m_buttons.size(); ++b)
+		{
+			bool is_pressed = pad_internal.m_buttons[b].m_pressed;
+
+			if (is_pressed && !last_pressed_states[i][b])
+			{
+				int lane = -1;
+				u32 code = pad_internal.m_buttons[b].m_outKeyCode;
+
+				// ★ヘッダーの定義に完全に一致させたマッピング
+				// 0:左縁, 1:左面, 2:右面, 3:右縁
+
+				// フェイスボタン (太鼓専用ヒットボタン)
+				if (code == CELL_PAD_CTRL_SQUARE)
+					lane = 0; // Taiko Hit Side Left
+				else if (code == CELL_PAD_CTRL_TRIANGLE)
+					lane = 1; // Taiko Hit Center Left
+				else if (code == CELL_PAD_CTRL_CROSS)
+					lane = 2; // Taiko Hit Center Right
+				else if (code == CELL_PAD_CTRL_CIRCLE)
+					lane = 3; // Taiko Hit Side Right
+
+				// 十字キー (補助的な割り当て)
+				else if (code == CELL_PAD_CTRL_LEFT)
+					lane = 0; // 左縁
+				else if (code == CELL_PAD_CTRL_UP)
+					lane = 1; // 左面
+				else if (code == CELL_PAD_CTRL_DOWN)
+					lane = 2; // 右面 (十字キー下)
+				else if (code == CELL_PAD_CTRL_RIGHT)
+					lane = 3; // 右縁 (十字キー右)
+
+				if (lane != -1)
+				{
+					std::lock_guard<std::mutex> lock(g_taiko_mutex);
+					uint player_idx = pad->m_player_id;
+					if (player_idx < 2)
+					{
+						g_taiko_queue[player_idx][lane].push_back(1);
+					}
+				}
+			}
+			last_pressed_states[i][b] = is_pressed;
+		}
+
+		// --- 2. 新しい版の「スティック補正」ロジック (維持) ---
 		std::array<AnalogStick, 4> squircled_sticks = pad_internal.m_sticks;
 
-		// Apply squircling
-		if (cfg->lpadsquircling != 0)
-		{
-			u16& lx = squircled_sticks[0].m_value;
-			u16& ly = squircled_sticks[1].m_value;
-
-			ConvertToSquirclePoint(lx, ly, cfg->lpadsquircling);
-		}
-
-		if (cfg->rpadsquircling != 0)
-		{
-			u16& rx = squircled_sticks[2].m_value;
-			u16& ry = squircled_sticks[3].m_value;
-
-			ConvertToSquirclePoint(rx, ry, cfg->rpadsquircling);
-		}
-
+		// 最後に一気に反映
 		pad->m_buttons = pad_internal.m_buttons;
-		pad->m_sticks = squircled_sticks; // Don't use std::move here. We assign values lockless, so std::move can lead to segfaults.
+		pad->m_sticks = squircled_sticks;
 	}
+
+
 }

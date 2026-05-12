@@ -22,11 +22,9 @@
 #include <queue>
 #include <deque>
 #include <mutex>
-
-LOG_CHANNEL(usio_log, "USIO");
-
 std::deque<int> g_taiko_queue[2][4];
 std::mutex g_taiko_mutex;
+LOG_CHANNEL(usio_log, "USIO");
 
 namespace
 {
@@ -357,10 +355,8 @@ void usb_device_usio::translate_input_taiko()
 	std::vector<u8> input_buf(0x60);
 	le_t<u16> digital_input = 0;
 
+	// 値を反転させるためのスイッチ（50⇔51）
 	static bool valueStates[2][4] = {};
-
-	// Tracks held state so holding a key does not spam hits
-	static bool lastPressed[2][4] = {};
 
 	const auto fire_hit = [&](u8* ptr, usz player, int lane)
 	{
@@ -368,37 +364,12 @@ void usb_device_usio::translate_input_taiko()
 			return;
 
 		bool& state = valueStates[player][lane];
-
 		u16 hit_val = state ? 51 : 50;
 		state = !state;
 
 		u16 analog_val = (hit_val << 15) / 100 + 1;
-
 		le_t<u16> out = analog_val;
-
 		std::memcpy(ptr, &out, sizeof(u16));
-	};
-
-	// Queue ONE hit only on press transition
-	const auto push_hit_if_new = [&](usz player, int lane, bool pressed)
-	{
-		if (player >= 2 || lane < 0 || lane >= 4)
-			return;
-
-		bool& wasPressed = lastPressed[player][lane];
-
-		// Rising edge only
-		if (pressed && !wasPressed)
-		{
-			std::lock_guard<std::mutex> qlock(g_taiko_mutex);
-
-			if (g_taiko_queue[player][lane].size() < 32)
-			{
-				g_taiko_queue[player][lane].push_back(1);
-			}
-		}
-
-		wasPressed = pressed;
 	};
 
 	const auto translate_from_pad = [&](usz pad_num, usz player)
@@ -409,105 +380,41 @@ void usb_device_usio::translate_input_taiko()
 		const usz offset = player * 8ULL;
 		auto& status = m_io_status[0];
 
-		if (const auto& pad = ::at32(handler->GetPads(), pad_num);
-			(pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && is_input_allowed())
+		if (const auto& pad = ::at32(handler->GetPads(), pad_num); (pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && is_input_allowed())
 		{
 			const auto& cfg = ::at32(g_cfg_usio.players, pad_num);
 
-			cfg->handle_input(pad, false,
-				[&](usio_btn btn, pad_button, u16, bool pressed, bool&)
+			cfg->handle_input(pad, false, [&](usio_btn btn, pad_button, u16, bool pressed, bool&)
 				{
-					switch (btn)
+					if (btn == usio_btn::test && player == 0)
 					{
-					case usio_btn::test:
+						if (pressed && !status.test_key_pressed)
+							status.test_on = !status.test_on;
+						status.test_key_pressed = pressed;
+					}
+					else if (btn == usio_btn::coin && player == 0)
 					{
-						if (player == 0)
-						{
-							if (pressed && !status.test_key_pressed)
-								status.test_on = !status.test_on;
-
-							status.test_key_pressed = pressed;
-						}
-						break;
+						if (pressed && !status.coin_key_pressed)
+							status.coin_counter++;
+						status.coin_key_pressed = pressed;
 					}
-
-					case usio_btn::coin:
-					{
-						if (player == 0)
-						{
-							if (pressed && !status.coin_key_pressed)
-								status.coin_counter++;
-
-							status.coin_key_pressed = pressed;
-						}
-						break;
-					}
-
-					case usio_btn::service:
-					{
-						if (player == 0 && pressed)
-							digital_input |= 0x4000;
-						break;
-					}
-
-					case usio_btn::enter:
-					{
-						if (player == 0 && pressed)
-							digital_input |= 0x200;
-						break;
-					}
-
-					case usio_btn::up:
-					{
-						if (player == 0 && pressed)
-							digital_input |= 0x2000;
-						break;
-					}
-
-					case usio_btn::down:
-					{
-						if (player == 0 && pressed)
-							digital_input |= 0x1000;
-						break;
-					}
-
-					case usio_btn::taiko_hit_side_left:
-					{
-						push_hit_if_new(player, 0, pressed);
-						break;
-					}
-
-					case usio_btn::taiko_hit_center_left:
-					{
-						push_hit_if_new(player, 1, pressed);
-						break;
-					}
-
-					case usio_btn::taiko_hit_center_right:
-					{
-						push_hit_if_new(player, 2, pressed);
-						break;
-					}
-
-					case usio_btn::taiko_hit_side_right:
-					{
-						push_hit_if_new(player, 3, pressed);
-						break;
-					}
-
-					default:
-						break;
-					}
+					else if (btn == usio_btn::service && player == 0 && pressed)
+						digital_input |= 0x4000;
+					else if (btn == usio_btn::enter && player == 0 && pressed)
+						digital_input |= 0x200;
+					else if (btn == usio_btn::up && player == 0 && pressed)
+						digital_input |= 0x2000;
+					else if (btn == usio_btn::down && player == 0 && pressed)
+						digital_input |= 0x1000;
 				});
 		}
 		else
 		{
-			std::lock_guard<std::mutex> qlock(g_taiko_mutex);
-
+			// 切断時のリセット処理
+			std::lock_guard<std::mutex> lock(g_taiko_mutex);
 			for (int i = 0; i < 4; ++i)
 			{
 				valueStates[player][i] = false;
-				lastPressed[player][i] = false;
 				g_taiko_queue[player][i].clear();
 			}
 		}
@@ -515,28 +422,26 @@ void usb_device_usio::translate_input_taiko()
 		if (player == 0 && status.test_on)
 			digital_input |= 0x80;
 
-		// Consume one queued hit per frame
+		// キューの消費処理
 		for (int i = 0; i < 4; ++i)
 		{
-			std::lock_guard<std::mutex> qlock(g_taiko_mutex);
+			std::lock_guard<std::mutex> lock(g_taiko_mutex);
 
 			if (!g_taiko_queue[player][i].empty())
 			{
+				// usio_log.error を使うとログ画面で目立つ色（赤）で表示されます
+				// usio_log.error("USIO: Pop Hit! Player: %d, Lane: %d, Remaining in Queue: %llu",
+				//(int)player, i, (unsigned long long)g_taiko_queue[player][i].size());
 				g_taiko_queue[player][i].pop_front();
 
-				fire_hit(
-					input_buf.data() + 32 + offset + i * 2,
-					player,
-					i
-				);
+				// ★修正ポイント: +34 を +32 に戻す
+				fire_hit(input_buf.data() + 32 + offset + i * 2, player, i);
 			}
 		}
 	};
 
 	for (usz i = 0; i < g_cfg_usio.players.size(); i++)
-	{
 		translate_from_pad(i, i);
-	}
 
 	std::memcpy(input_buf.data(), &digital_input, sizeof(u16));
 	std::memcpy(input_buf.data() + 16, &m_io_status[0].coin_counter, sizeof(u16));
@@ -1605,6 +1510,10 @@ void usb_device_usio::bngrw_feed_bytes(const u8* data, u32 size)
 
 void usb_device_usio::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoint, UsbTransfer* transfer)
 {
+	transfer->fake = true;
+	transfer->expected_result = HC_CC_NOERR;
+	transfer->expected_time = get_system_time();
+	transfer->expected_count = buf_size;
 	constexpr u8 USIO_COMMAND_WRITE = 0x90;
 	constexpr u8 USIO_COMMAND_READ  = 0x10;
 	constexpr u8 USIO_COMMAND_INIT  = 0xA0;
@@ -1616,10 +1525,10 @@ void usb_device_usio::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoint, Us
 	static u16 usio_register = 0;
 	static u16 usio_length   = 0;
 
-	transfer->fake            = true;
-	transfer->expected_result = HC_CC_NOERR;
+	//transfer->fake            = true;
+	//transfer->expected_result = HC_CC_NOERR;
 	// The latency varies per operation but it doesn't seem to matter for this device so let's go fast!
-	transfer->expected_time = get_timestamp() + 1'000;
+	//transfer->expected_time = get_timestamp() + 1'000;
 
 	is_used = true;
 
@@ -1628,14 +1537,25 @@ void usb_device_usio::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoint, Us
 	case 0x01:
 	{
 		// Write endpoint
-		transfer->expected_count = buf_size;
-
+		//transfer->expected_count = buf_size;
+		if (buf_size == 6 && (buf[0] & 0xF0) == USIO_COMMAND_READ)
+		{
+			u16 reg = *reinterpret_cast<le_t<u16>*>(&buf[2]);
+			if (reg == 0x1080)
+			{
+				response_seek = 0;
+				response.clear();
+				usio_read(buf[0] & 0xF, reg, *reinterpret_cast<le_t<u16>*>(&buf[4]));
+				// 状態を壊さず、読み取りだけ完了して戻る
+				return;
+			}
+		}
 		if (expecting_data)
 		{
 			usio_data.insert(usio_data.end(), buf, buf + buf_size);
-			usio_length -= buf_size;
+			
 
-			if (usio_length == 0)
+			if(usio_data.size() >= usio_length)
 			{
 				expecting_data = false;
 				usio_write(usio_channel, usio_register, usio_data);
